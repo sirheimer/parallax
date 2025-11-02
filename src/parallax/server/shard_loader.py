@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import mlx.core as mx
 import safetensors
+import torch
 from mlx import nn
 from mlx_lm.utils import get_model_path, load_config
 
@@ -22,6 +23,20 @@ MODEL_CLASS_MAP = {
     "kimi_k2": "mlx_lm.models.deepseek_v3",
     "minimax": "parallax.models.minimax",
 }
+
+# Build list of dtypes that NumPy doesn't support
+_UNSUPPORTED_NUMPY_DTYPES = [torch.bfloat16]
+if hasattr(torch, 'float8_e4m3fn'):
+    _UNSUPPORTED_NUMPY_DTYPES.append(torch.float8_e4m3fn)
+if hasattr(torch, 'float8_e5m2'):
+    _UNSUPPORTED_NUMPY_DTYPES.append(torch.float8_e5m2)
+
+
+def _convert_tensor_to_numpy(tensor: torch.Tensor):
+    """Convert a PyTorch tensor to NumPy, handling unsupported dtypes."""
+    if tensor.dtype in _UNSUPPORTED_NUMPY_DTYPES:
+        tensor = tensor.to(torch.float32)
+    return tensor.numpy()
 
 
 class MLXModelLoader:
@@ -166,7 +181,7 @@ class MLXModelLoader:
         layer_key_prefix = "model.layers"  # Common prefix
 
         for wf in weight_files:
-            # For bf16 models, we need torch tensors as a bridge
+            # Load tensors from safetensors using PyTorch as intermediate format
             with safetensors.safe_open(wf, framework="pt") as f:
                 for key in f.keys():
                     is_needed = False
@@ -181,7 +196,7 @@ class MLXModelLoader:
                         is_needed = True
                         remapped_key = key.replace("model.", "", 1)
                         if model_shard.is_last_shard and config.get("tie_word_embeddings", False):
-                            shard_weights["lm_head.weight"] = mx.array(f.get_tensor(key).numpy())
+                            shard_weights["lm_head.weight"] = mx.array(_convert_tensor_to_numpy(f.get_tensor(key)))
                     elif model_shard.is_last_shard:
                         if "model.norm" in key:
                             is_needed = True
@@ -212,7 +227,7 @@ class MLXModelLoader:
 
                     # If the key is needed, load only that tensor from the file
                     if is_needed:
-                        shard_weights[remapped_key] = mx.array(f.get_tensor(key).numpy())
+                        shard_weights[remapped_key] = mx.array(_convert_tensor_to_numpy(f.get_tensor(key)))
 
         if (quantization := config.get("quantization", None)) is not None:
             logger.info("Model is quantized. Applying quantization parameters...")
