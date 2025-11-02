@@ -181,7 +181,7 @@ class MLXModelLoader:
                         is_needed = True
                         remapped_key = key.replace("model.", "", 1)
                         if model_shard.is_last_shard and config.get("tie_word_embeddings", False):
-                            shard_weights["lm_head.weight"] = mx.array(f.get_tensor(key))
+                            shard_weights["lm_head.weight"] = mx.array(f.get_tensor(key).numpy())
                     elif model_shard.is_last_shard:
                         if "model.norm" in key:
                             is_needed = True
@@ -212,7 +212,7 @@ class MLXModelLoader:
 
                     # If the key is needed, load only that tensor from the file
                     if is_needed:
-                        shard_weights[remapped_key] = mx.array(f.get_tensor(key))
+                        shard_weights[remapped_key] = mx.array(f.get_tensor(key).numpy())
 
         if (quantization := config.get("quantization", None)) is not None:
             logger.info("Model is quantized. Applying quantization parameters...")
