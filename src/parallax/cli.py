@@ -241,6 +241,11 @@ def join_command(args, passthrough_args: list[str] | None = None):
     if not _flag_present(passthrough_args, ["--kv-block-size"]):
         cmd.extend(["--kv-block-size", "32"])
 
+    # Add legacy GPU flag if specified
+    if args.legacy_gpu:
+        cmd.extend(["--legacy-gpu"])
+        logger.info("Legacy GPU mode enabled")
+
     # The scheduler address is now taken directly from the parsed arguments.
     cmd.extend(["--scheduler-addr", args.scheduler_addr])
 
@@ -398,6 +403,11 @@ Examples:
     )
     join_parser.add_argument(
         "-u", "--skip-upload", action="store_true", help="Skip upload package info"
+    )
+    join_parser.add_argument(
+        "--legacy-gpu",
+        action="store_true",
+        help="Enable support for older GPUs (GTX 10/20 series, RTX 20 series)",
     )
 
     # Add 'chat' command parser

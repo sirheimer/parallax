@@ -31,21 +31,6 @@ MODEL_CLASS_MAP = {
     "minimax": "parallax.models.minimax",
 }
 
-# Build list of dtypes that NumPy doesn't support
-_UNSUPPORTED_NUMPY_DTYPES = [torch.bfloat16]
-if hasattr(torch, 'float8_e4m3fn'):
-    _UNSUPPORTED_NUMPY_DTYPES.append(torch.float8_e4m3fn)
-if hasattr(torch, 'float8_e5m2'):
-    _UNSUPPORTED_NUMPY_DTYPES.append(torch.float8_e5m2)
-
-
-def _convert_tensor_to_numpy(tensor: torch.Tensor):
-    """Convert a PyTorch tensor to NumPy, handling unsupported dtypes."""
-    if tensor.dtype in _UNSUPPORTED_NUMPY_DTYPES:
-        tensor = tensor.to(torch.float32)
-    return tensor.numpy()
-
-
 class MLXModelLoader:
     """
     Handles downloading model assets from Hugging Face (if needed) and loading

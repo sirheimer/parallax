@@ -149,6 +149,12 @@ def parse_args() -> argparse.Namespace:
 
     # GPU/SGLang specialized configuration
     parser.add_argument(
+        "--legacy-gpu",
+        action="store_true",
+        help="Enable support for older GPUs (GTX 10/20 series, RTX 20 series). Automatically uses torch_native attention backend.",
+    )
+
+    parser.add_argument(
         "--attention-backend",
         type=str,
         default="flashinfer",
@@ -271,6 +277,15 @@ def parse_args() -> argparse.Namespace:
     )
 
     args = parser.parse_args()
+
+    # Apply legacy GPU settings if enabled
+    if args.legacy_gpu:
+        logger.info("Legacy GPU mode enabled - using torch_native attention backend")
+        args.attention_backend = "torch_native"
+        # Reduce batch size for older GPUs if not explicitly set
+        if args.max_batch_size == 8:  # Default value
+            args.max_batch_size = 4
+            logger.info("Reduced max_batch_size to 4 for legacy GPU compatibility")
 
     # Validate arguments
     validate_args(args)

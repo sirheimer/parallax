@@ -117,12 +117,44 @@ class NvidiaHardwareInfo(HardwareInfo):
     # Best-effort device database; can be extended as needed
     _GPU_DB: ClassVar[Dict[str, Dict[str, float]]] = {
         # key: substring to match in CUDA device name (case-insensitive)
+        # High-end data center GPUs
         "a100-80g": {"tflops_fp16": 312.0, "bandwidth_gbps": 2039.0},
         "a100 80": {"tflops_fp16": 312.0, "bandwidth_gbps": 2039.0},
         "a100-40g": {"tflops_fp16": 312.0, "bandwidth_gbps": 1935.0},
         "a100 40": {"tflops_fp16": 312.0, "bandwidth_gbps": 1935.0},
+        "h100": {"tflops_fp16": 989.0, "bandwidth_gbps": 3350.0},
+        # RTX 50-series (Blackwell)
         "rtx 5090": {"tflops_fp16": 104.8, "bandwidth_gbps": 1792.0},
+        # RTX 40-series (Ada Lovelace)
         "rtx 4090": {"tflops_fp16": 82.6, "bandwidth_gbps": 1008.0},
+        "rtx 4080": {"tflops_fp16": 48.7, "bandwidth_gbps": 716.8},
+        "rtx 4070 ti": {"tflops_fp16": 40.1, "bandwidth_gbps": 504.2},
+        "rtx 4070": {"tflops_fp16": 29.2, "bandwidth_gbps": 504.2},
+        "rtx 4060 ti": {"tflops_fp16": 22.1, "bandwidth_gbps": 288.0},
+        "rtx 4060": {"tflops_fp16": 15.1, "bandwidth_gbps": 272.0},
+        # RTX 30-series (Ampere) - Legacy support starts here
+        "rtx 3090 ti": {"tflops_fp16": 40.0, "bandwidth_gbps": 1008.0},
+        "rtx 3090": {"tflops_fp16": 35.6, "bandwidth_gbps": 936.2},
+        "rtx 3080 ti": {"tflops_fp16": 34.1, "bandwidth_gbps": 912.4},
+        "rtx 3080": {"tflops_fp16": 29.8, "bandwidth_gbps": 760.0},
+        "rtx 3070 ti": {"tflops_fp16": 21.8, "bandwidth_gbps": 608.3},
+        "rtx 3070": {"tflops_fp16": 20.4, "bandwidth_gbps": 448.0},
+        "rtx 3060 ti": {"tflops_fp16": 16.2, "bandwidth_gbps": 448.0},
+        "rtx 3060": {"tflops_fp16": 12.7, "bandwidth_gbps": 360.0},
+        # RTX 20-series (Turing)
+        "rtx 2080 ti": {"tflops_fp16": 26.9, "bandwidth_gbps": 616.0},
+        "rtx 2080 super": {"tflops_fp16": 22.8, "bandwidth_gbps": 496.0},
+        "rtx 2080": {"tflops_fp16": 20.3, "bandwidth_gbps": 448.0},
+        "rtx 2070 super": {"tflops_fp16": 18.1, "bandwidth_gbps": 448.0},
+        "rtx 2070": {"tflops_fp16": 14.9, "bandwidth_gbps": 448.0},
+        "rtx 2060 super": {"tflops_fp16": 14.2, "bandwidth_gbps": 448.0},
+        "rtx 2060": {"tflops_fp16": 12.7, "bandwidth_gbps": 336.0},
+        # GTX 10-series (Pascal)
+        "gtx 1080 ti": {"tflops_fp16": 11.3, "bandwidth_gbps": 484.0},
+        "gtx 1080": {"tflops_fp16": 8.9, "bandwidth_gbps": 320.0},
+        "gtx 1070 ti": {"tflops_fp16": 8.2, "bandwidth_gbps": 256.0},
+        "gtx 1070": {"tflops_fp16": 6.5, "bandwidth_gbps": 256.0},
+        "gtx 1060": {"tflops_fp16": 4.4, "bandwidth_gbps": 192.0},
     }
 
     @classmethod
