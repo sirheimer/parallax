@@ -5,7 +5,7 @@ build-backend = "poetry.core.masonry.api"
 
 [project]
 name = "parallax"
-version = "0.0.1"
+version = "0.1.2"
 description = "Decentralised pipeline-parallel LLM serving with Sglang + MLX-LM + Lattica"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
@@ -19,6 +19,8 @@ dependencies = [
   "msgpack>=1.0.7",
   "safetensors>=0.5.1",
   "huggingface-hub",
+  "transformers==4.57.1",
+  "jinja2>=3.1.0",
   "numpy>=1.26",
   "pyzmq>=25.0",
   "psutil>=5.9.5",
@@ -28,10 +30,10 @@ dependencies = [
   "uvloop",
   "fastapi",
   "pydantic",
-  "py-machineid",
   "protobuf==6.31.1",
   "dijkstar==2.6.0",
-  "lattica==1.0.9",
+  "lattica==1.0.14",
+  "orjson",
 ]
 
 [project.scripts]
@@ -46,9 +48,15 @@ mac = [
 ]
 
 gpu = [
+  "sglang[all]==0.5.5",
   "mlx-lm==0.28.0",
   "mlx[cpu]==0.29.1",
-  "sglang[all]==0.5.4.post1",
+]
+
+vllm = [
+  "vllm==0.11.0",
+  "mlx-lm==0.28.0",
+  "mlx[cpu]==0.29.1",
 ]
 
 benchmark = [

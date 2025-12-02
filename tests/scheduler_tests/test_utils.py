@@ -12,6 +12,7 @@ from scheduling.node import Node, NodeHardwareInfo
 
 A100_80G = NodeHardwareInfo(
     node_id="a100-80g",
+    num_gpus=1,
     tflops_fp16=312.0,
     gpu_name="",
     memory_gb=80.0,
@@ -20,6 +21,7 @@ A100_80G = NodeHardwareInfo(
 )
 A100_40G = NodeHardwareInfo(
     node_id="a100-40g",
+    num_gpus=1,
     tflops_fp16=312.0,
     gpu_name="",
     memory_gb=40.0,
@@ -28,6 +30,7 @@ A100_40G = NodeHardwareInfo(
 )
 RTX5090 = NodeHardwareInfo(
     node_id="rtx5090",
+    num_gpus=1,
     tflops_fp16=104.8,
     gpu_name="",
     memory_gb=32.0,
@@ -36,6 +39,7 @@ RTX5090 = NodeHardwareInfo(
 )
 RTX4090 = NodeHardwareInfo(
     node_id="rtx4090",
+    num_gpus=1,
     tflops_fp16=82.6,
     gpu_name="",
     memory_gb=24.0,
@@ -78,6 +82,7 @@ def build_node(
     """Create a `Node` with hardware info and attach test-only coordinates/bandwidth."""
     hw = NodeHardwareInfo(
         node_id=node_id,
+        num_gpus=1,
         tflops_fp16=tflops,
         gpu_name="",
         memory_gb=mem_gb,
@@ -131,16 +136,21 @@ def compute_rtts_from_coords(nodes: Iterable[Node]) -> Dict[Tuple[str, str], flo
 
 
 def set_rtt_from_coords(nodes: List[Node]) -> None:
-    """Attach an RTT getter to each node based on their coordinates."""
-    rtts = compute_rtts_from_coords(nodes)
+    """Populate `rtt_to_nodes` on each node based on their coordinates."""
+    all_rtts = compute_rtts_from_coords(nodes)
+    node_map = {n.node_id: n for n in nodes}
+    ids = list(node_map.keys())
 
-    def getter(src: Node, dst: Node) -> float:
-        if src.node_id == dst.node_id:
-            return 0.0
-        return rtts.get((src.node_id, dst.node_id), 200.0)
-
-    for n in nodes:
-        n.rtt_getter = getter
+    for aid in ids:
+        node_a = node_map[aid]
+        if node_a.rtt_to_nodes is None:
+            node_a.rtt_to_nodes = {}
+        for bid in ids:
+            if aid == bid:
+                continue
+            rtt = all_rtts.get((aid, bid))
+            if rtt is not None:
+                node_a.rtt_to_nodes[bid] = rtt
 
 
 def geo_rtt_provider(positions: Dict[str, Tuple[float, float]]):

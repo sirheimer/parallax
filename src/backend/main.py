@@ -12,11 +12,15 @@ from fastapi.staticfiles import StaticFiles
 from backend.server.request_handler import RequestHandler
 from backend.server.scheduler_manage import SchedulerManage
 from backend.server.server_args import parse_args
-from backend.server.static_config import get_model_list, get_node_join_command
-from common.file_util import get_project_root
-from common.version_check import check_latest_release
+from backend.server.static_config import (
+    get_model_list,
+    get_node_join_command,
+    init_model_info_dict_cache,
+)
 from parallax_utils.ascii_anime import display_parallax_run
+from parallax_utils.file_util import get_project_root
 from parallax_utils.logging_config import get_logger, set_log_level
+from parallax_utils.version_check import check_latest_release
 
 app = FastAPI()
 
@@ -51,18 +55,57 @@ async def scheduler_init(raw_request: Request):
     model_name = request_data.get("model_name")
     init_nodes_num = request_data.get("init_nodes_num")
     is_local_network = request_data.get("is_local_network")
-    if scheduler_manage.is_running():
-        # todo reinit
-        pass
-    else:
+
+    # Validate required parameters
+    if model_name is None:
+        return JSONResponse(
+            content={
+                "type": "scheduler_init",
+                "error": "model_name is required",
+            },
+            status_code=400,
+        )
+    if init_nodes_num is None:
+        return JSONResponse(
+            content={
+                "type": "scheduler_init",
+                "error": "init_nodes_num is required",
+            },
+            status_code=400,
+        )
+
+    try:
+        # If scheduler is already running, stop it first
+        if scheduler_manage.is_running():
+            logger.info(f"Stopping existing scheduler to switch to model: {model_name}")
+            scheduler_manage.stop()
+
+        # Start scheduler with new model
+        logger.info(
+            f"Initializing scheduler with model: {model_name}, init_nodes_num: {init_nodes_num}"
+        )
         scheduler_manage.run(model_name, init_nodes_num, is_local_network)
-    return JSONResponse(
-        content={
-            "type": "scheduler_init",
-            "data": None,
-        },
-        status_code=200,
-    )
+
+        return JSONResponse(
+            content={
+                "type": "scheduler_init",
+                "data": {
+                    "model_name": model_name,
+                    "init_nodes_num": init_nodes_num,
+                    "is_local_network": is_local_network,
+                },
+            },
+            status_code=200,
+        )
+    except Exception as e:
+        logger.exception(f"Error initializing scheduler: {e}")
+        return JSONResponse(
+            content={
+                "type": "scheduler_init",
+                "error": str(e),
+            },
+            status_code=500,
+        )
 
 
 @app.get("/node/join/command")
@@ -126,8 +169,13 @@ if __name__ == "__main__":
     args = parse_args()
     set_log_level(args.log_level)
     logger.info(f"args: {args}")
+
+    if args.model_name is None:
+        init_model_info_dict_cache(args.use_hfcache)
+
     if args.log_level != "DEBUG":
         display_parallax_run()
+
     check_latest_release()
 
     scheduler_manage = SchedulerManage(
@@ -140,6 +188,7 @@ if __name__ == "__main__":
         ],
         announce_maddrs=args.announce_maddrs,
         http_port=args.port,
+        use_hfcache=args.use_hfcache,
     )
 
     request_handler.set_scheduler_manage(scheduler_manage)

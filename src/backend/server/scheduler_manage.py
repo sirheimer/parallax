@@ -32,6 +32,7 @@ class SchedulerManage:
         host_maddrs: List[str] = [],
         announce_maddrs: List[str] = [],
         http_port: int = 3001,
+        use_hfcache: bool = False,
     ):
         """Initialize the manager with networking bootstrap parameters."""
         self.initial_peers = initial_peers
@@ -40,6 +41,7 @@ class SchedulerManage:
         self.host_maddrs = host_maddrs
         self.announce_maddrs = announce_maddrs
         self.http_port = http_port
+        self.use_hfcache = use_hfcache
         self.model_name = None
         self.init_nodes_num = None
         self.scheduler = None
@@ -51,6 +53,8 @@ class SchedulerManage:
     def run(self, model_name, init_nodes_num, is_local_network=True):
         """
         Start the scheduler and the P2P service for RPC handling.
+        If Lattica is already running, it will be reused.
+        Nodes will automatically rejoin via their heartbeat (node_update) mechanism.
         """
         logger.debug(
             f"SchedulerManage starting: model_name={model_name}, init_nodes_num={init_nodes_num}"
@@ -77,6 +81,25 @@ class SchedulerManage:
         """
         return self.scheduler is not None
 
+    def stop(self):
+        """
+        Stop the scheduler only. Lattica will remain running.
+        """
+        logger.info("Stopping scheduler...")
+
+        # Stop scheduler if running
+        if self.scheduler is not None:
+            logger.debug("Stopping scheduler...")
+            self.scheduler._stop_event.set()
+            # Wait a bit for threads to finish
+            time.sleep(0.1)
+            self.scheduler = None
+            logger.debug("Scheduler stopped")
+
+        # Note: We don't close Lattica here to allow model switching without restarting P2P
+
+        logger.info("Scheduler stopped")
+
     def get_model_name(self):
         return self.model_name
 
@@ -91,6 +114,9 @@ class SchedulerManage:
             return None
         return self.lattica.peer_id()
 
+    def need_more_nodes(self):
+        return self.scheduler.need_more_nodes() if self.scheduler else False
+
     def get_cluster_status(self):
         return {
             "type": "cluster_status",
@@ -102,6 +128,7 @@ class SchedulerManage:
                     self.get_peer_id(), self.is_local_network
                 ),
                 "node_list": self.get_node_list(),
+                "need_more_nodes": self.need_more_nodes(),
             },
         }
 
@@ -115,22 +142,26 @@ class SchedulerManage:
         return {
             "node_id": node.node_id,
             "status": NODE_STATUS_AVAILABLE if node.is_active else NODE_STATUS_WAITING,
+            "gpu_num": node.hardware.num_gpus,
             "gpu_name": node.hardware.gpu_name,
             "gpu_memory": node.hardware.memory_gb,
         }
 
     def _start_scheduler(self, model_name, init_nodes_num):
         """
-        Create the scheduler and start its background run loop if needed.
+        Create the scheduler and start its background run loop.
+        If scheduler already exists, it will be stopped and recreated.
+        Nodes will automatically rejoin via their heartbeat (node_update) mechanism.
         """
+        # Stop existing scheduler if running
         if self.scheduler is not None:
-            logger.debug("Scheduler already started; skipping re-initialization")
-            return
+            logger.info("Scheduler already running, stopping it first for re-initialization")
+            self.stop()
 
         self.model_name = model_name
         self.init_nodes_num = init_nodes_num
 
-        model_info = get_model_info(model_name)
+        model_info = get_model_info(model_name, self.use_hfcache)
         self.scheduler = Scheduler(model_info, [], min_nodes_bootstrapping=init_nodes_num)
 
         # Run the scheduler's event/dispatch loops in background so the process
@@ -142,11 +173,30 @@ class SchedulerManage:
             daemon=True,
         ).start()
         logger.debug("Scheduler background thread started (poll_interval=0.05)")
+        logger.info("Nodes will automatically rejoin via heartbeat (node_update) mechanism")
 
     def _start_lattica(self):
         """
         Initialize and start the Lattica P2P node used for RPCs.
+        If Lattica already exists, it will be reused (no restart), but connection_handler will be updated.
         """
+        # Reuse existing Lattica if running
+        if self.lattica is not None:
+            logger.debug("Lattica already running, reusing existing instance")
+            # Update connection handler with new scheduler if it exists
+            if hasattr(self, "connection_handler") and self.connection_handler is not None:
+                self.connection_handler.scheduler = self.scheduler
+                logger.debug("Updated connection handler with new scheduler")
+            else:
+                # Create connection handler if it doesn't exist
+                self.connection_handler = RPCConnectionHandler(
+                    lattica=self.lattica,
+                    scheduler=self.scheduler,
+                    http_port=self.http_port,
+                )
+                logger.debug("Created connection handler with existing Lattica")
+            return
+
         logger.debug(
             f"Starting Lattica with host_maddrs={self.host_maddrs}, mdns=False, dht_prefix={self.dht_prefix}"
         )
@@ -247,7 +297,7 @@ class SchedulerManage:
         # todo rebalance status
         status = (
             NODE_STATUS_AVAILABLE
-            if self.scheduler.layer_allocator.has_full_active_pipeline()
+            if self.scheduler.layer_allocator.has_full_pipeline(active_only=True)
             else NODE_STATUS_WAITING
         )
         logger.debug(f"SchedulerManage status queried: {status}")

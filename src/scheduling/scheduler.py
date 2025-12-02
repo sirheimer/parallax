@@ -116,25 +116,51 @@ class Scheduler:
             pass
 
     # Orchestration helpers
-    def bootstrap(self) -> bool:
-        """Bootstrapping: first-time layer allocation and optional warm-up.
+    def bootstrap(self, *, clear_existing: bool = False, skip_warmup: bool = False) -> bool:
+        """Bootstrapping:
+        This method can be used for both initial bootstrapping and global rebalancing.
+        When clear_existing=True, it first deallocates all existing allocations before
+        performing global allocation (rebalancing behavior). When clear_existing=False,
+        it performs allocation on top of existing state (initial bootstrapping behavior).
 
-        Returns True if a full pipeline was established; False otherwise.
+        Args:
+            clear_existing: If True, deallocate all existing allocations before reallocating.
+                This is used for global rebalancing. Default is False.
+            skip_warmup: If True, skip the warm-up and truncate step. Default is False.
+
+        Returns:
+            True if a full pipeline was established; False otherwise.
         """
-        if len(self.nodes) < self.min_nodes_bootstrapping:
+        # Check node count only for initial bootstrapping (not rebalancing)
+        if not clear_existing and len(self.nodes) < self.min_nodes_bootstrapping:
             logger.debug(
                 f"Bootstrapping deferred: have {len(self.nodes)} nodes; need >= {self.min_nodes_bootstrapping}"
             )
             return False
-        logger.debug("Bootstrapping layer allocator")
+
+        # Clear existing allocations if this is a rebalance
+        if clear_existing:
+            logger.debug("Performing global rebalance (clearing existing allocations)")
+            self._bootstrapped = False
+            self._bootstrapped_event.clear()
+            for n in self.nodes:
+                if n.start_layer is not None and n.end_layer is not None:
+                    self.layer_allocator.deallocate(n)
+        else:
+            logger.debug("Bootstrapping layer allocator")
+
+        # Perform global allocation
         success = self.layer_allocator.global_allocation()
         if not success:
-            logger.warning("Bootstrapping failed to produce a full pipeline")
+            logger.warning("Global allocation failed to produce a full pipeline")
             return False
+
         assignments = self.list_node_allocations()
         logger.debug(f"Layer allocator assignments: {assignments}")
+
         # Optional warm-up to find turning points and truncate node ranges
-        if self.request_warm_up_for_reshard > 0:
+        # Skip warmup for rebalancing scenarios (can be overridden with skip_warmup=False)
+        if not skip_warmup and self.request_warm_up_for_reshard > 0:
             self._run_warmup_and_truncate()
             assignments = self.list_node_allocations()
             logger.debug(f"Layer allocator assignments after turn-point warm-up: {assignments}")
@@ -142,9 +168,11 @@ class Scheduler:
         if not self.layer_allocator.has_full_pipeline():
             logger.warning("Bootstrapping failed to produce a full pipeline")
             return False
+
         self._bootstrapped = True
         self._bootstrapped_event.set()
-        logger.debug("Bootstrapping completed successfully; full pipeline established")
+        action = "rebalance" if clear_existing else "bootstrapping"
+        logger.debug(f"{action.capitalize()} completed successfully; full pipeline established")
         return True
 
     def list_node_allocations(self) -> List[Tuple[str, int, int]]:
@@ -152,25 +180,41 @@ class Scheduler:
         return self.layer_allocator.list_node_allocations()
 
     # Warm-up and re-shard
-    def _run_warmup_and_truncate(self) -> None:
+    def _run_warmup_and_truncate(self, override_warmup_count: int = 0) -> None:
         """Run a brief warm-up to detect truncation points and shrink shards.
 
         Uses layer-level DP turning points (node_id, layer_idx, kind):
         - kind == "tail": drop [layer_idx, end) on that node
         - kind == "head": drop [start, layer_idx) on that node
+
+        Note: Always uses DynamicProgrammingRouting for finding turning points,
+        regardless of the current request_router type, since turning points
+        detection requires layer-level DP analysis.
+
+        Args:
+            override_warmup_count: If > 0, use this value instead of request_warm_up_for_reshard.
+                Default is 0, which means use request_warm_up_for_reshard.
         """
         nodes_list = list(self.nodes)
         if not nodes_list:
             return
         num_layers = self.model_info.num_layers
+
         # The number of warm-up requests can be used to repeat detection, but a
         # single pass is sufficient with our DP model; we repeat to smooth noise.
+        warmup_count = (
+            override_warmup_count if override_warmup_count > 0 else self.request_warm_up_for_reshard
+        )
+
         agg_turns: Dict[Tuple[str, int, str], int] = {}
-        for _ in range(self.request_warm_up_for_reshard):
-            turns = self.request_router.find_turning_points(nodes_list, num_layers)
+        for _ in range(warmup_count):
+            turns = DynamicProgrammingRouting.find_turning_points(nodes_list, num_layers)
             for t in turns:
                 agg_turns[t] = agg_turns.get(t, 0) + 1
+
         # Apply truncation for consistently observed turning points
+        # Note: Must use layer_allocator.allocate/deallocate to properly update
+        # internal state (node_allocation dict and layer_to_load)
         for node_id, layer_idx, kind in agg_turns:
             node = next((n for n in self.nodes if n.node_id == node_id), None)
             if node is None or node.start_layer is None or node.end_layer is None:
@@ -178,10 +222,10 @@ class Scheduler:
             start, end = node.start_layer, node.end_layer
             if kind == "tail":
                 if layer_idx < end:
-                    node.set_layer_allocation(start, layer_idx)
+                    self.layer_allocator.reallocate(node, start, layer_idx)
             elif kind == "head":
                 if layer_idx > start:
-                    node.set_layer_allocation(layer_idx, end)
+                    self.layer_allocator.reallocate(node, layer_idx, end)
 
     def update_node_info(
         self,
@@ -198,7 +242,7 @@ class Scheduler:
         if layer_latency_ms is not None:
             node.set_layer_latency_ms(layer_latency_ms)
         if new_rtt_to_nodes is not None:
-            node.rtt_to_nodes.update(new_rtt_to_nodes)
+            node.rtt_to_nodes = new_rtt_to_nodes
         if is_active is not None:
             node.is_active = is_active
         node.last_heartbeat = time.time()
@@ -250,14 +294,43 @@ class Scheduler:
     def join(self, node: Node, bootstrap: bool = False) -> None:
         """Add a node to allocation and refresh plan and materialized nodes."""
         logger.debug(
-            "Joining node %s (kv_ratio=%.2f, param_ratio=%.2f)",
+            "Joining node %s (kv_ratio=%.2f, param_ratio=%.2f, manual_assignment=%s)",
             node.node_id,
-            node.kv_cache_ratio,
-            node.param_hosting_ratio,
+            node.kvcache_mem_ratio,
+            node.param_mem_ratio,
+            node.manual_layer_assignment,
         )
         self.layer_allocator.declare(node)
-        if not bootstrap:
+
+        # Manual layer assignment bypasses bootstrap waiting
+        if node.manual_layer_assignment:
+            # Manual layer assignment: use the layers specified by the node
+            if node.start_layer is None or node.end_layer is None:
+                raise ValueError(
+                    f"Node {node.node_id} has manual_layer_assignment=True "
+                    f"but start_layer ({node.start_layer}) or end_layer ({node.end_layer}) is None"
+                )
+            logger.info(
+                f"Manual layer assignment for node {node.node_id}: "
+                f"layers [{node.start_layer}, {node.end_layer})"
+            )
+            # Directly allocate the specified layers without automatic assignment
+            self.layer_allocator.allocate(node, node.start_layer, node.end_layer)
+
+            # Check if manual allocations now cover the full pipeline
+            if self.layer_allocator.has_full_pipeline():
+                if not self._bootstrapped:
+                    logger.info(
+                        "Manual layer assignments have established a full pipeline; "
+                        "marking scheduler as bootstrapped"
+                    )
+                    self._bootstrapped = True
+                    self._bootstrapped_event.set()
+        elif not bootstrap:
+            # Automatic layer assignment (only after bootstrap)
             self.layer_allocator.join(node)
+        # If bootstrap=True and not manual, node is only declared (allocation deferred to bootstrap())
+
         # Notify waiters that node count changed
         with self._node_count_cv:
             self._node_count_cv.notify_all()
@@ -273,14 +346,35 @@ class Scheduler:
         self.layer_allocator.leave(node_id)
         if self.layer_allocator.should_global_rebalance():
             logger.debug("Global rebalance triggered due to node leave")
-            # TODO: send a signal to the nodes to stop running requests
-            #       and re-assign start/end layers so nodes can re-shard
-            self._bootstrapped = False
-            self._bootstrapped_event.clear()
-            for n in self.nodes:
-                if n.start_layer is not None and n.end_layer is not None:
-                    self.layer_allocator.deallocate(n)
-            self.layer_allocator.global_allocation()
+
+            # Count manual vs automatic nodes
+            manual_count = sum(1 for n in self.nodes if n.manual_layer_assignment)
+            total_count = len(self.nodes)
+            logger.debug(
+                f"Node count: {manual_count} manual, {total_count - manual_count} automatic"
+            )
+            if manual_count == total_count:
+                logger.debug("All nodes are manual assignment, skipping global rebalance")
+            elif manual_count > 0:
+                logger.error(
+                    f"Mixed assignment detected ({manual_count} manual, {total_count - manual_count} automatic); skipping rebalance"
+                )
+            else:
+                # All nodes are automatic, try adjustment first, then rebalance if needed
+                if not self.layer_allocator.has_full_pipeline():
+                    logger.debug(
+                        "No full pipeline after node leave, attempting warmup and truncate"
+                    )
+                    self._run_warmup_and_truncate(override_warmup_count=1)
+                    if not self.layer_allocator.has_full_pipeline():
+                        self.bootstrap(clear_existing=True, skip_warmup=True)
+                    else:
+                        logger.debug(
+                            "Pipeline recovered through warmup and truncate, skipping global rebalance"
+                        )
+                else:
+                    self.bootstrap(clear_existing=True, skip_warmup=True)
+
         with self._node_count_cv:
             self._node_count_cv.notify_all()
 
@@ -422,7 +516,8 @@ class Scheduler:
                 req = self._request_queue.get(timeout=poll_interval)
                 if req is None:
                     continue
-                path, _ = self.request_router.find_optimal_path(self.nodes, self.num_layers)
+                path, path_rtt = self.request_router.find_optimal_path(self.nodes, self.num_layers)
+                logger.debug(f"Path RTT: {path_rtt}")
                 req.routing_table = path
                 for node_id in path:
                     n = self.node_id_to_node[node_id]
@@ -459,6 +554,9 @@ class Scheduler:
                 node_id, cur, lat, rtts, is_active = self._pending_node_updates.get_nowait()
             except queue.Empty:
                 break
+            if node_id not in self.node_id_to_node:
+                logger.warning(f"Node {node_id} not found in node list, ignore the update")
+                continue
             self.update_node_info(
                 self.node_id_to_node[node_id],
                 current_requests=cur,
@@ -470,6 +568,7 @@ class Scheduler:
     def _process_joins(self) -> None:
         """Handle pending join events, honoring bootstrap state for assignment."""
         joined_any = False
+        had_manual_assignment = False
         while True:
             try:
                 node = self._pending_joins.get_nowait()
@@ -477,14 +576,18 @@ class Scheduler:
                 break
             # During bootstrap (no full pipeline yet), only declare nodes; no dynamic assignment.
             # After bootstrap, allow dynamic light-weight joins.
+            # Exception: manual layer assignments are processed immediately regardless of bootstrap state.
             self.join(node, bootstrap=not self._bootstrapped_event.is_set())
             joined_any = True
+            if node.manual_layer_assignment:
+                had_manual_assignment = True
 
         # If we are not bootstrapped (e.g., after a leave-triggered rebalance) and
         # new nodes just joined, attempt a greedy bootstrap immediately when we have
         # enough nodes. If it doesn't produce a full pipeline, we'll try again on
         # subsequent joins.
-        if joined_any and not self._bootstrapped_event.is_set():
+        # Skip bootstrap if manual assignments were used (they handle bootstrapping internally).
+        if joined_any and not self._bootstrapped_event.is_set() and not had_manual_assignment:
             if len(self.nodes) >= self.min_nodes_bootstrapping:
                 try:
                     ok = self.bootstrap()
@@ -521,3 +624,6 @@ class Scheduler:
         self._wake_event.set()
         with self._node_count_cv:
             self._node_count_cv.notify_all()
+
+    def need_more_nodes(self):
+        return not self._bootstrapped and len(self.nodes) >= self.min_nodes_bootstrapping

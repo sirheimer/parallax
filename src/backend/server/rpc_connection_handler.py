@@ -40,8 +40,8 @@ class RPCConnectionHandler(ConnectionHandler):
         #         "memory_gb": 100,
         #         "memory_bandwidth_gbps": 100,
         #     },
-        #     "kv_cache_ratio": 0.3,
-        #     "param_hosting_ratio": 0.5,
+        #     "kvcache_mem_ratio": 0.3,
+        #     "param_mem_ratio": 0.5,
         #     "max_concurrent_requests": 16,
         #     "max_sequence_length": 1024,
         # }
@@ -73,6 +73,20 @@ class RPCConnectionHandler(ConnectionHandler):
         logger.debug(f"receive node_update request: {message}")
         try:
             node = self.build_node(message)
+            # Check if node exists in scheduler
+            if node.node_id not in self.scheduler.node_id_to_node:
+                # Node not found, automatically join it (e.g., after model switch)
+                logger.info(
+                    f"Node {node.node_id} not found in scheduler, auto-joining via node_update"
+                )
+                self.scheduler.enqueue_join(node)
+                # Wait a bit for join to be processed
+                time.sleep(0.1)
+                # Return layer allocation after join
+                layer_allocation = self.wait_layer_allocation(node.node_id, wait_seconds=5)
+                return layer_allocation
+
+            # Node exists, update its info
             self.scheduler.enqueue_node_update(
                 node.node_id,
                 current_requests=node.current_requests,
@@ -80,7 +94,9 @@ class RPCConnectionHandler(ConnectionHandler):
                 new_rtt_to_nodes=node.rtt_to_nodes,
                 is_active=node.is_active,
             )
-            return {}
+            # Return current layer allocation to node
+            layer_allocation = self.get_layer_allocation(node.node_id)
+            return layer_allocation
         except Exception as e:
             logger.exception(f"node_update error: {e}")
             return {}
@@ -151,6 +167,7 @@ class RPCConnectionHandler(ConnectionHandler):
                         ),
                         "start_layer": start_layer,
                         "end_layer": end_layer,
+                        "tp_size": node.hardware.num_gpus,
                     }
         return {}
 
@@ -159,11 +176,12 @@ class RPCConnectionHandler(ConnectionHandler):
             node_id=node_json.get("node_id"),
             hardware=self.build_hardware(node_json.get("hardware")),
             model_info=self.scheduler.model_info,
-            kv_cache_ratio=node_json.get("kv_cache_ratio"),
-            param_hosting_ratio=node_json.get("param_hosting_ratio"),
+            kvcache_mem_ratio=node_json.get("kvcache_mem_ratio"),
+            param_mem_ratio=node_json.get("param_mem_ratio"),
             max_concurrent_requests=node_json.get("max_concurrent_requests"),
             max_sequence_length=node_json.get("max_sequence_length"),
             is_active=node_json.get("is_active", True),
+            manual_layer_assignment=node_json.get("manual_layer_assignment", False),
         )
         if node_json.get("start_layer", None) is not None:
             node.start_layer = node_json.get("start_layer")
@@ -179,6 +197,7 @@ class RPCConnectionHandler(ConnectionHandler):
 
     def build_hardware(self, hardware_json):
         node_id = hardware_json.get("node_id")
+        num_gpus = hardware_json.get("num_gpus")
         tflops_fp16 = hardware_json.get("tflops_fp16")
         gpu_name = hardware_json.get("gpu_name")
         memory_gb = hardware_json.get("memory_gb")
@@ -186,6 +205,7 @@ class RPCConnectionHandler(ConnectionHandler):
         device = hardware_json.get("device")
         return NodeHardwareInfo(
             node_id=node_id,
+            num_gpus=num_gpus,
             tflops_fp16=tflops_fp16,
             gpu_name=gpu_name,
             memory_gb=memory_gb,

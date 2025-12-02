@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { Link as RouterLink, useNavigate } from 'react-router-dom';
 import {
+  Alert,
   Button,
   ButtonGroup,
   FormControl,
@@ -22,8 +23,14 @@ import { useRefCallback } from '../hooks';
 
 export default function PageSetup() {
   const [
-    { networkType, initNodesNumber, modelName, modelInfoList },
-    { setNetworkType, setInitNodesNumber, setModelName, init },
+    {
+      config: { networkType, initNodesNumber, modelInfo },
+      clusterInfo: { status: clusterStatus },
+    },
+    {
+      config: { setNetworkType, setInitNodesNumber },
+      init,
+    },
   ] = useCluster();
 
   const navigate = useNavigate();
@@ -31,12 +38,17 @@ export default function PageSetup() {
   const [loading, setLoading] = useState(false);
 
   const onContinue = useRefCallback(async () => {
-    setLoading(true);
-    Promise.resolve()
-      .then(() => init())
-      .then(() => navigate('/join'))
-      .catch((e) => console.error(e))
-      .finally(() => setLoading(false));
+    if (clusterStatus === 'idle' || clusterStatus === 'failed') {
+      setLoading(true);
+      Promise.resolve()
+        .then(() => init())
+        .then(() => navigate('/join'))
+        .catch((e) => console.error(e))
+        .finally(() => setLoading(false));
+      return;
+    } else {
+      navigate('/join');
+    }
   });
 
   return (
@@ -107,6 +119,18 @@ export default function PageSetup() {
         </Stack>
 
         <ModelSelect />
+
+        {!!modelInfo && modelInfo.vram > 0 && (
+          <Alert key='vram-warning' severity='warning' variant='standard'>
+            <Typography variant='inherit'>
+              {[
+                `You’ll need a `,
+                <strong>{`minimum of ${modelInfo.vram} GB of total VRAM`}</strong>,
+                ` to host this model.`,
+              ]}
+            </Typography>
+          </Alert>
+        )}
       </Stack>
 
       <Stack direction='row' justifyContent='flex-end' alignItems='center' gap={2}>

@@ -7,8 +7,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import iterate_in_threadpool
 
 from backend.server.constants import NODE_STATUS_AVAILABLE
-from common.request_metrics import get_request_metrics
 from parallax_utils.logging_config import get_logger
+from parallax_utils.request_metrics import get_request_metrics
 
 logger = get_logger(__name__)
 
@@ -63,14 +63,14 @@ class RequestHandler:
             except Exception as e:
                 logger.exception(f"get_routing_table error: {e}")
                 return JSONResponse(
-                    content={"error": "Routing table not found"},
+                    content={"error": "Get routing table error"},
                     status_code=500,
                 )
 
             # None -> scheduler has not set yet; treat as hard error (no waiting here)
             if routing_table is None:
                 return JSONResponse(
-                    content={"error": "Routing not ready"},
+                    content={"error": "Routing pipelines not ready"},
                     status_code=503,
                 )
 
@@ -89,7 +89,7 @@ class RequestHandler:
         # If still empty after retries, return 429 Too Many Requests
         if routing_table is not None and len(routing_table) == 0:
             return JSONResponse(
-                content={"error": "All pipelines are busy. Please retry later."},
+                content={"error": "All pipelines are busy or not ready. Please retry later."},
                 status_code=429,
             )
 
@@ -146,10 +146,10 @@ class RequestHandler:
                 return resp
             else:
                 response = stub.chat_completion(request_data)
-                response = next(response).decode()
+                content = (await anext(iterate_in_threadpool(response))).decode()
                 logger.debug(f"Non-stream response completed for {request_id}")
                 # response is a JSON string; parse to Python object before returning
-                return JSONResponse(content=json.loads(response))
+                return JSONResponse(content=json.loads(content))
         except Exception as e:
             logger.exception(f"Error in _forward_request: {e}")
             return JSONResponse(

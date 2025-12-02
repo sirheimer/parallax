@@ -12,7 +12,7 @@ Scheduling primitives for distributed LLM inference.
 import time
 from dataclasses import dataclass, field
 from math import floor
-from typing import Callable, Dict, List, Optional
+from typing import Dict, List, Optional
 
 from parallax_utils.logging_config import get_logger
 from parallax_utils.utils import bytes_per_element, compute_max_batch_size
@@ -31,6 +31,7 @@ class NodeHardwareInfo:
     """
 
     node_id: str
+    num_gpus: int
     tflops_fp16: float
     gpu_name: str
     memory_gb: float
@@ -72,6 +73,7 @@ class RooflinePerformanceModel:
         batch_size: int = 1,
         target_seq_len: int = 1,
         source_seq_len: int = 256,
+        using_mlx: bool = False,
     ) -> None:
         self.tflops = hardware.tflops_fp16
         self.io_bandwidth = hardware.memory_bandwidth_gbps
@@ -80,6 +82,7 @@ class RooflinePerformanceModel:
         self.batch_size = batch_size
         self.target_seq_len = target_seq_len
         self.source_seq_len = source_seq_len
+        self.using_mlx = using_mlx
 
     def get_compute_roofline_latency_ms(self, flops: int) -> float:
         """Compute-bound latency in milliseconds for the given floating-point ops."""
@@ -108,14 +111,14 @@ class RooflinePerformanceModel:
         self,
         include_input_embed: bool = False,
         include_lm_head: bool = False,
-        num_decoder_layers: int = 1,
+        num_current_layers: int = 1,
     ) -> float:
         """Estimate latency to execute the specified layer set on this node.
 
         Args:
             include_input_embed: Whether to include input embedding I/O
             include_lm_head: Whether to include LM head compute and I/O
-            num_decoder_layers: Number of decoder layers included
+            num_current_layers: Number of decoder layers included
 
         Returns:
             Total latency (ms) combining decoder layers and optional endpoints.
@@ -127,14 +130,15 @@ class RooflinePerformanceModel:
                 source_seq_len=self.source_seq_len,
             )
         )
-        decoder_layer_io_latency = self.get_io_roofline_latency_ms(
-            self.model_info.decoder_layer_io_bytes(
-                roofline=True,
-                batch_size=self.batch_size,
-                target_seq_len=self.target_seq_len,
-                source_seq_len=self.source_seq_len,
-            )
+        model_btyes = self.model_info.decoder_layer_io_bytes(
+            roofline=True,
+            batch_size=self.batch_size,
+            target_seq_len=self.target_seq_len,
+            source_seq_len=self.source_seq_len,
         )
+        if self.using_mlx:
+            model_btyes *= self.model_info.mlx_bit_factor
+        decoder_layer_io_latency = self.get_io_roofline_latency_ms(model_btyes)
 
         # For first / last layers
         flops, io_bytes = 0, 0
@@ -149,9 +153,9 @@ class RooflinePerformanceModel:
         compute_time_ms = self.get_compute_roofline_latency_ms(flops)
         io_time_ms = self.get_io_roofline_latency_ms(io_bytes)
         return (
-            num_decoder_layers * max(decoder_layer_compute_latency, decoder_layer_io_latency)
+            num_current_layers * max(decoder_layer_compute_latency, decoder_layer_io_latency)
             + max(compute_time_ms, io_time_ms)
-        ) / num_decoder_layers
+        ) / num_current_layers
 
 
 @dataclass
@@ -170,12 +174,13 @@ class Node:
     hardware: NodeHardwareInfo
     model_info: ModelInfo
 
-    kv_cache_ratio: float = 0.3
-    param_hosting_ratio: float = 0.5
+    kvcache_mem_ratio: float = 0.3
+    param_mem_ratio: float = 0.5
 
     max_concurrent_requests: int = 16
     max_sequence_length: int = 4096
 
+    manual_layer_assignment: bool = False
     start_layer: Optional[int] = None  # inclusive
     end_layer: Optional[int] = None  # exclusive
     current_requests: int = 0
@@ -189,7 +194,6 @@ class Node:
     load_compensator: float = 0.05
 
     rtt_to_nodes: Optional[Dict[str, float]] = None
-    rtt_getter: Optional[Callable[["Node", "Node"], float]] = None
 
     _force_max_concurrent_requests: bool = False
 
@@ -217,8 +221,8 @@ class Node:
             requested_max_batch_size=self.max_concurrent_requests,
             max_sequence_len=self.max_sequence_length,
             device=None,
-            kv_cache_memory_fraction=self.kv_cache_ratio,
-            num_shard_layers=self.num_decoder_layers,
+            kv_cache_memory_fraction=self.kvcache_mem_ratio,
+            num_shard_layers=self.num_current_layers,
             num_key_value_heads=self.model_info.num_kv_heads,
             head_dim=self.model_info.head_size,
             elem_bytes=elem_bytes,
@@ -241,19 +245,6 @@ class Node:
         if self.start_layer is None or self.end_layer is None:
             return 0
         return self.end_layer - self.start_layer
-
-    @property
-    def num_decoder_layers(self) -> int:
-        """Number of decoder layers."""
-        if self.start_layer is None or self.end_layer is None:
-            return 0
-        start_layer = self.start_layer + 1 if self.has_embedding else self.start_layer
-        end_layer = self.end_layer - 1 if self.has_lm_head else self.end_layer
-        if start_layer >= end_layer:
-            raise ValueError(
-                f"Node {self.node_id} has invalid decoder layer range: start_layer {start_layer} <= end_layer {end_layer}"
-            )
-        return end_layer - start_layer
 
     @property
     def has_embedding(self) -> bool:
@@ -282,7 +273,12 @@ class Node:
         Capacity is measured using the parameter memory budget on the device.
         """
         available_memory_bytes = floor(
-            self.hardware.memory_gb * 1024 * 1024 * 1024 * self.param_hosting_ratio
+            self.hardware.num_gpus
+            * self.hardware.memory_gb
+            * 1024
+            * 1024
+            * 1024
+            * self.param_mem_ratio
         )
         if include_input_embed:
             available_memory_bytes -= self.model_info.embedding_io_bytes
@@ -290,11 +286,6 @@ class Node:
             if not (include_input_embed and self.model_info.tie_embedding):
                 available_memory_bytes -= self.model_info.embedding_io_bytes
 
-        logger.debug(
-            "Node available_memory_bytes=%d, decoder_layer_io_bytes=%d",
-            available_memory_bytes,
-            self.model_info.decoder_layer_io_bytes(roofline=False),
-        )
         if self.hardware.device == "mlx":
             # For mlx, consider mlx bit factor
             return floor(
@@ -312,11 +303,18 @@ class Node:
     @property
     def per_decoder_layer_kv_cache_memory(self) -> Optional[int]:
         """Return the available memory for kv cache per layer."""
-        if self.num_decoder_layers == 0:
+        if self.num_current_layers == 0:
             return None
         return floor(
-            (self.hardware.memory_gb * 1024 * 1024 * 1024 * self.kv_cache_ratio)
-            / self.num_decoder_layers
+            (
+                self.hardware.num_gpus
+                * self.hardware.memory_gb
+                * 1024
+                * 1024
+                * 1024
+                * self.kvcache_mem_ratio
+            )
+            / self.num_current_layers
         )
 
     def set_layer_allocation(self, start_layer: int, end_layer: int) -> None:
@@ -349,11 +347,12 @@ class Node:
             batch_size=self.current_requests,
             target_seq_len=1,
             source_seq_len=self.max_sequence_length,
+            using_mlx=self.hardware.device == "mlx",
         )
         return perf_model.roofline_layer_latency_ms(
             include_input_embed=self.has_embedding,
             include_lm_head=self.has_lm_head,
-            num_decoder_layers=self.num_decoder_layers,
+            num_current_layers=self.num_current_layers,
         )
 
     @property
@@ -375,19 +374,19 @@ class Node:
         self.rtt_to_nodes[target_node_id] = rtt_ms
 
     def get_rtt_to(self, other: "Node") -> float:
-        """Get RTT to another node, measuring via `rtt_getter` if needed.
+        """Get RTT to another node from cached RTTs.
 
-        Falls back to 0.0 if no getter is provided and no cached RTT exists.
+        Returns:
+            RTT in milliseconds, or float("inf") if no cached RTT exists.
         """
         if self == other:
             return 0.0
-        if other.node_id in self.rtt_to_nodes:
-            return self.rtt_to_nodes[other.node_id]
-        if self.rtt_getter is None:
-            return 0.0
-        rtt_ms = float(self.rtt_getter(self, other))
-        self.update_rtt(other.node_id, rtt_ms)
-        return rtt_ms
+        if self.rtt_to_nodes is None:
+            return float("inf")
+        if other.node_id not in self.rtt_to_nodes:
+            logger.warning("Cannot find RTT from node %s to node %s", self.node_id, other.node_id)
+            return float("inf")
+        return self.rtt_to_nodes[other.node_id]
 
     def hosts_layer(self, layer_id: int) -> bool:
         """Return True if this node hosts the given layer id.

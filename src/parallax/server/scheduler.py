@@ -24,8 +24,8 @@ from collections import OrderedDict
 from typing import Dict, List, Optional
 
 from parallax.server.kv_cache import KVCacheManager
-from parallax.server.metrics import update_metrics
 from parallax.server.request import InitialRequest, Request, RequestStatus
+from parallax.utils.shared_state import SharedState
 from parallax_utils.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -47,6 +47,7 @@ class Scheduler:
         is_first_peer: bool = False,
         kv_cache_manager: Optional[KVCacheManager] = None,
         request_timeout_s: Optional[int] = 600,
+        shared_state: Optional[SharedState] = None,
         **kwargs,
     ):
         """
@@ -66,8 +67,8 @@ class Scheduler:
         self.is_first_peer = is_first_peer
         if is_first_peer:
             # Load configs for building InitialRequest
-            self.tokenizer = kwargs.get("tokenizer")
-            self.eos_token_id = self.tokenizer.eos_token_id
+            self.tokenizer = kwargs.get("tokenizer", None)
+            self.eos_token_id = kwargs.get("eos_token_id", None)
             self.max_new_tokens = kwargs.get("max_new_tokens", 512)
             self.max_total_length = kwargs.get("max_total_length", 1024)
 
@@ -77,6 +78,7 @@ class Scheduler:
         self._running_requests: Dict[str, Request] = OrderedDict()
 
         self.kv_cache_manager = kv_cache_manager
+        self.shared_state = shared_state
         # Default timeout for requests if not set on request object
         self.request_timeout_s = request_timeout_s
 
@@ -150,8 +152,9 @@ class Scheduler:
             logger.debug(f"Evicted request {request_id} from scheduler.")
             # Update metrics only if running count changed since last report
             try:
-                curr = self.num_running_requests
-                update_metrics(current_requests=curr)
+                if self.shared_state is not None:
+                    curr = self.num_running_requests
+                    self.shared_state.update_metrics(current_requests=curr)
             except Exception:
                 pass
         else:
@@ -179,7 +182,20 @@ class Scheduler:
         last_token_id = request.output_ids[-1] if request.output_ids else None
         if request.abort:
             finished = True
-        if last_token_id == self.eos_token_id:
+        if not request.sampling_params.ignore_eos and (
+            self.eos_token_id
+            and (
+                last_token_id == self.eos_token_id
+                or (isinstance(self.eos_token_id, list) and last_token_id in self.eos_token_id)
+            )
+        ):
+            request.update_status(RequestStatus.FINISHED_EOS)
+            finished = True
+        elif not request.sampling_params.ignore_eos and (
+            self.tokenizer
+            and self.tokenizer.eos_token_id
+            and last_token_id == self.tokenizer.eos_token_id
+        ):
             request.update_status(RequestStatus.FINISHED_EOS)
             finished = True
         elif request.output_length >= request.max_new_tokens:
@@ -201,20 +217,24 @@ class Scheduler:
 
         Pushes admitted requests directly into the running set.
         """
+        # TODO: pop directly from wait queue ?
         while self._wait_queue and len(self._running_requests) < self.max_batch_size:
             req = self._wait_queue.pop(0)
             rid = req.request_id
             if rid in self._running_requests:
-                # Already inflight; chunked-prefill, skip
                 continue
+
             # Check kv cache pool
             if self.kv_cache_manager is not None:
                 if not self.kv_cache_manager.has_request(req.request_id):
-                    if not self.kv_cache_manager.add_request(req, req.total_length):
+                    # TODO: Handle chunked prefill, and support preemption.
+                    if not self.kv_cache_manager.allocate_request(req.request_id, req.total_length):
                         logger.warning(
                             f"Request {rid} can't be admit to running batch due to KV cache size."
                         )
                         continue
+
+            # Add request to running requests
             self._running_requests[rid] = req
             # Initialize timing for timeout enforcement
             req.last_updated_time = time.time()
@@ -224,10 +244,11 @@ class Scheduler:
 
         # Reflect current running requests metric after admission
         try:
-            curr = self.num_running_requests
-            if curr != self._last_reported_running_requests:
-                update_metrics(current_requests=curr)
-                self._last_reported_running_requests = curr
+            if self.shared_state is not None:
+                curr = self.num_running_requests
+                if curr != self._last_reported_running_requests:
+                    self.shared_state.update_metrics(current_requests=curr)
+                    self._last_reported_running_requests = curr
         except Exception:
             pass
 
@@ -244,7 +265,7 @@ class Scheduler:
             try:
                 if req.last_updated_time is None:
                     raise ValueError("Requests should have last updated time set.")
-                if now - req.last_updated_time > self.timeout_s:
+                if now - req.last_updated_time > self.request_timeout_s:
                     req.abort = True
                     timed_out.append(req)
             except Exception:
